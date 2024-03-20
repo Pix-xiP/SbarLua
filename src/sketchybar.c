@@ -3,8 +3,9 @@
 #include <lauxlib.h>
 #include <lua.h>
 #include <lualib.h>
-#include <stdio.h>
-#include <unistd.h>
+#include <CoreFoundation/CoreFoundation.h>
+#include <stdint.h>
+
 #include "stack.h"
 
 #define CMD_SUCCESS 1
@@ -23,8 +24,9 @@ lua_State* g_state;
 #define HOTLOAD   "--hotload"
 #define TRIGGER   "--trigger"
 #define PUSH      "--push"
+#define REMOVE    "--remove"
 
-#define MACH_HELPER_FMT "git.relay.sketchybar%d"
+#define MACH_HELPER_FMT "git.lua.sketchybar%d"
 
 struct callback {
   int callback_ref;
@@ -57,14 +59,6 @@ static char *luat_to_string(int type) {
   }
 }
 
-static inline void event_server_init(char* bootstrap_name) {
-  mach_server_register(&g_mach_server, bootstrap_name);
-}
-
-static inline void event_server_run(mach_handler event_handler) {
-  mach_server_begin(&g_mach_server, event_handler);
-}
-
 static char* sketchybar(struct stack* stack) {
   uint32_t message_length;
   char* message = stack_flatten_ttb(stack, &message_length);
@@ -85,31 +79,51 @@ static char* sketchybar(struct stack* stack) {
   char message_format[message_length + 1];
   memcpy(message_format, message, message_length);
   message_format[message_length] = '\0';
-  char* response = mach_send_message(g_port, message_format, message_length + 1);
+  char* response = mach_send_message(g_port,
+                                     message_format,
+                                     message_length + 1,
+                                     true               );
   if (!response) {
     g_port = mach_get_bs_port(g_bs_lookup);
-    response = mach_send_message(g_port, message_format, message_length + 1);
+    response = mach_send_message(g_port,
+                                 message_format,
+                                 message_length + 1,
+                                 true               );
   }
   return response;
 }
 
-static void transaction_create() {
+static void sketchybar_call_log_and_cleanup(struct stack* stack) {
+  char* response = sketchybar(stack);
+  if (response) {
+    if (strlen(response) > 0) printf("[i] sketchybar: %s\n", response);
+    free(response);
+  }
+  stack_destroy(stack);
+}
+
+static int transaction_create(lua_State* state) {
   if (!g_cmd) {
     g_cmd = malloc(1);
     g_cmd_len = 0;
     *g_cmd = '\0';
   }
+  return 0;
 }
 
-static char* transaction_commit() {
+static int transaction_commit(lua_State* state) {
   char* response = NULL;
   if (g_cmd) {
     response = sketchybar(NULL);
     free(g_cmd);
+    if (response) {
+      if (strlen(response) > 0) printf("[i] sketchybar: %s\n", response);
+      free(response);
+    }
     g_cmd_len = 0;
     g_cmd = NULL;
   }
-  return response;
+  return 0;
 }
 
 int animate(lua_State* state) {
@@ -127,7 +141,7 @@ int animate(lua_State* state) {
   snprintf(duration_str, 4, "%d", duration);
   const char* interp = lua_tostring(state, -3);
 
-  transaction_create();
+  transaction_create(state);
 
   struct stack* stack = stack_create();
   stack_init(stack);
@@ -135,17 +149,14 @@ int animate(lua_State* state) {
   stack_push(stack, interp);
   stack_push(stack, ANIMATE);
 
-  char* response = sketchybar(stack);
-  stack_destroy(stack);
+  sketchybar_call_log_and_cleanup(stack);
 
-  if (response) free(response);
   int error = lua_pcall(state, 0, 0, 0);
 
   if (error && lua_gettop(state)) {
     printf("[!] Lua: %s\n", lua_tostring(state, -1));
   }
-  response = transaction_commit();
-  if (response) free(response);
+  transaction_commit(state);
   return 0;
 }
 
@@ -182,9 +193,7 @@ int set(lua_State* state) {
 
   stack_push(stack, name);
   stack_push(stack, SET);
-  char* response = sketchybar(stack);
-  if (response) free(response);
-  stack_destroy(stack);
+  sketchybar_call_log_and_cleanup(stack);
   return 0;
 }
 
@@ -201,9 +210,7 @@ int defaults(lua_State* state) {
   parse_kv_table(state, NULL, stack);
   stack_push(stack, DEFAULT);
 
-  char* response = sketchybar(stack);
-  stack_destroy(stack);
-  if (response) free(response);
+  sketchybar_call_log_and_cleanup(stack);
   return 0;
 }
 
@@ -219,13 +226,30 @@ int bar(lua_State* state) {
   parse_kv_table(state, NULL, stack);
   stack_push(stack, BAR);
 
-  char* response = sketchybar(stack);
-  stack_destroy(stack);
-  if (response) free(response);
+  sketchybar_call_log_and_cleanup(stack);
   return 0;
 }
 
-void callback_function(env env) {
+void callback_function(char* message, size_t len) {
+  if (len > 1 + sizeof(int) && message && *message == '\x07') {
+    int callback_ref = 0;
+    memcpy(&callback_ref, message + 1, sizeof(int));
+    char* response = message + 1 + sizeof(int);
+    lua_rawgeti(g_state, LUA_REGISTRYINDEX, callback_ref);
+    if (!json_to_lua_table(g_state, response)) {
+      lua_pushstring(g_state, response);
+    }
+
+    transaction_create(g_state);
+    int error = lua_pcall(g_state, 1, 0, 0);
+
+    if (error && lua_gettop(g_state)) {
+      printf("[!] Lua: %s\n", lua_tostring(g_state, -1));
+    }
+    transaction_commit(g_state);
+    return;
+  }
+  env env = message;
   char* name = env_get_value_for_key(env, "NAME");
   char* sender = env_get_value_for_key(env, "SENDER");
 
@@ -250,14 +274,13 @@ void callback_function(env env) {
         }
       } while(kv.key && kv.value);
 
-      transaction_create();
+      transaction_create(g_state);
       int error = lua_pcall(g_state, 1, 0, 0);
 
       if (error && lua_gettop(g_state)) {
         printf("[!] Lua: %s\n", lua_tostring(g_state, -1));
       }
-      char* response = transaction_commit();
-      if (response) free(response);
+      transaction_commit(g_state);
       break;
     }
   }
@@ -279,9 +302,7 @@ void subscribe_register_event(const char* name, const char* event, int callback_
   stack_push(stack, event);
   stack_push(stack, event_op);
   stack_push(stack, ADD);
-  char* response = sketchybar(stack);
-  stack_destroy(stack);
-  if (response) free(response);
+  sketchybar_call_log_and_cleanup(stack);
 
   int index = -1;
   for (int i = 0; i < g_callbacks.num_callbacks; i++) {
@@ -312,9 +333,7 @@ void subscribe_register_event(const char* name, const char* event, int callback_
   stack_push(stack, name);
   stack_push(stack, SUBSCRIBE);
 
-  response = sketchybar(stack);
-  stack_destroy(stack);
-  if (response) free(response);
+  sketchybar_call_log_and_cleanup(stack);
 }
 
 int subscribe(lua_State* state) {
@@ -367,9 +386,11 @@ int query(lua_State* state) {
   stack_init(stack);
   stack_push(stack, query);
   stack_push(stack, QUERY);
-  transaction_commit();
+  bool transaction_interrupted = g_cmd != NULL;
+  transaction_commit(state);
   char* response = sketchybar(stack);
   stack_destroy(stack);
+  if (transaction_interrupted) transaction_create(state);
   if (response) {
     json_to_lua_table(state, response);
     free(response);
@@ -409,9 +430,7 @@ int push(lua_State *state) {
 
   stack_push(stack, name);
   stack_push(stack, PUSH);
-  char *response = sketchybar(stack);
-  stack_destroy(stack);
-  if (response) free(response);
+  sketchybar_call_log_and_cleanup(stack);
 
   return 0;
 }
@@ -546,9 +565,7 @@ int add(lua_State* state) {
   stack_push(stack, name);
   stack_push(stack, type);
   stack_push(stack, ADD);
-  char* response = sketchybar(stack);
-  if (response) free(response);
-  stack_destroy(stack);
+  sketchybar_call_log_and_cleanup(stack);
 
   // If a table is presented as the last argument, we parse it as if it
   // was passed to the set domain.
@@ -579,16 +596,45 @@ int add(lua_State* state) {
   return 1;
 }
 
+int remove_sbar(lua_State* state) {
+  if (lua_gettop(state) < 1) {
+    char error[] = "[Lua] Error: expecting at least one argument "
+                   "for 'remove'";
+    printf("%s\n", error);
+    return 0;
+  }
+
+  const char* name = get_name_from_state(state);
+  struct stack* stack = stack_create();
+  stack_init(stack);
+  stack_push(stack, name);
+  stack_push(stack, REMOVE);
+  sketchybar_call_log_and_cleanup(stack);
+  return 0;}
+
+static void orphan_check() {
+  if (getppid() == 1) exit(0);
+}
+
 int event_loop(lua_State* state) {
   g_state = state;
   struct stack* stack = stack_create();
   stack_init(stack);
   stack_push(stack, UPDATE);
-  char* response = sketchybar(stack);
-  stack_destroy(stack);
-  if (response) free(response);
+  sketchybar_call_log_and_cleanup(stack);
   alarm(0);
-  event_server_run(callback_function);
+  mach_server_begin(&g_mach_server, callback_function);
+  CFRunLoopTimerRef orphan_timer
+     = CFRunLoopTimerCreate(kCFAllocatorDefault,
+                            CFAbsoluteTimeGetCurrent() + 1.0,
+                            1.0,
+                            0,
+                            0,
+                            orphan_check,
+                            NULL                             );
+  CFRunLoopAddTimer(CFRunLoopGetMain(), orphan_timer, kCFRunLoopDefaultMode);
+  CFRelease(orphan_timer);
+  CFRunLoopRun();
   return 0;
 }
 
@@ -608,9 +654,7 @@ int hotload(lua_State* state) {
     stack_push(stack, "off");
   }
   stack_push(stack, HOTLOAD);
-  char* response = sketchybar(stack);
-  if (response) free(response);
-  stack_destroy(stack);
+  sketchybar_call_log_and_cleanup(stack);
   return 0;
 }
 
@@ -643,9 +687,7 @@ int trigger(lua_State *state) {
   // No errors, lets parse the trigger state:
   stack_push(stack, event);
   stack_push(stack, TRIGGER);
-  char *response = sketchybar(stack);
-  stack_destroy(stack);
-  if (response) free(response);
+  sketchybar_call_log_and_cleanup(stack);
 
   return 0;
 }
@@ -669,23 +711,115 @@ int set_bar_name(lua_State* state) {
 int exec(lua_State* state) {
   if (lua_gettop(state) < 1
       || lua_type(state, 1) != LUA_TSTRING) {
-    char error[] = "[Lua] Error: expecting a string argument "
+    char error[] = "[Lua] Error: expecting a string as first argument "
                    "for 'exec'";
     printf("%s\n", error);
     return 0;
   }
 
+  int callback_ref = 0;
+  if (lua_gettop(state) > 1 && lua_type(state, 2) == LUA_TFUNCTION) {
+    lua_pushvalue(state, 2);
+    callback_ref = luaL_ref(state, LUA_REGISTRYINDEX);
+  }
   const char* command = lua_tostring(state, 1);
 
   int pid = fork();
   if (pid != 0) return 0;
 
-  char *exec[] = { "/usr/bin/env", "sh", "-c", (char*)command, NULL };
-  exit(execvp(exec[0], exec));
+  alarm(60);
+  if (!callback_ref) {
+    char *exec[] = { "/usr/bin/env", "sh", "-c", (char*)command, NULL };
+    exit(execvp(exec[0], exec));
+  } else {
+    FILE* file = popen(command, "r");
+    char* result = malloc(1024);
+    size_t read_bytes = 0;
+    size_t total_bytes = 0;
+    while ((read_bytes = fread(result + total_bytes, 1, 1024, file)) > 0) {
+      total_bytes += read_bytes;
+      result = realloc(result, total_bytes + 1024);
+    }
+    size_t message_size = total_bytes + sizeof(int) + sizeof(char);
+    char message[message_size];
+    message[0] = '\x07';
+    memcpy(message + 1, &callback_ref, sizeof(int));
+    memcpy(message + 1 + sizeof(int), result, total_bytes);
+
+    mach_send_message(mach_get_bs_port(g_bootstrap_name),
+                      message,
+                      message_size,
+                      false                              );
+
+    free(result);
+    exit(pclose(file));
+  }
+}
+
+void delay_callback(CFRunLoopTimerRef timer, void* context) {
+  int callback_ref = (int)(intptr_t)context;
+
+  lua_rawgeti(g_state, LUA_REGISTRYINDEX, callback_ref);
+  transaction_create(g_state);
+  int error = lua_pcall(g_state, 0, 0, 0);
+
+  if (error && lua_gettop(g_state)) {
+    printf("[!] Lua: %s\n", lua_tostring(g_state, -1));
+  }
+
+  transaction_commit(g_state);
+}
+
+int delay(lua_State* state) {
+  if (lua_gettop(state) < 2
+      || lua_type(state, 1) != LUA_TNUMBER
+      || lua_type(state, 2) != LUA_TFUNCTION) {
+    char error[] = "[Lua] Error: expecting a number and a function as"
+                   " arguments for 'delay'";
+    printf("%s\n", error);
+    return 0;
+  }
+
+  lua_pushvalue(state, 2);
+  int callback_ref = luaL_ref(state, LUA_REGISTRYINDEX);
+
+  lua_gettop(state);
+
+  double duration = lua_tonumber(state, 1);
+  CFRunLoopTimerContext context = { 0 };
+  context.info = (void*)(intptr_t)callback_ref;
+  CFRunLoopTimerRef timer
+     = CFRunLoopTimerCreate(kCFAllocatorDefault,
+                            CFAbsoluteTimeGetCurrent() + duration,
+                            0,
+                            0,
+                            0,
+                            delay_callback,
+                            &context                              );
+
+  CFRunLoopAddTimer(CFRunLoopGetMain(), timer, kCFRunLoopDefaultMode);
+  CFRelease(timer);
+  return 0;
+}
+
+static int os_execute_sig(lua_State *L) {
+  const char *cmd = luaL_optstring(L, 1, NULL);
+  int stat;
+  errno = 0;
+  signal(SIGCHLD, SIG_DFL);
+  stat = system(cmd);
+  signal(SIGCHLD, SIG_IGN);
+  if (cmd != NULL)
+    return luaL_execresult(L, stat);
+  else {
+    lua_pushboolean(L, stat);  /* true if there is a shell */
+    return 1;
+  }
 }
 
 static const struct luaL_Reg functions[] = {
     { "add", add },
+    { "remove", remove_sbar },
     { "set", set },
     { "bar", bar },
     { "default", defaults },
@@ -698,6 +832,9 @@ static const struct luaL_Reg functions[] = {
     { "trigger", trigger },
     { "push", push},
     { "exec", exec },
+    { "delay", delay },
+    { "begin_config", transaction_create },
+    { "end_config", transaction_commit },
     {NULL, NULL}
 };
 
@@ -706,7 +843,15 @@ int luaopen_sketchybar(lua_State* L) {
   snprintf(g_bootstrap_name, sizeof(g_bootstrap_name), MACH_HELPER_FMT,
                                                        (int)(intptr_t)L);
 
-  event_server_init(g_bootstrap_name);
+  signal(SIGCHLD, SIG_IGN);
+  signal(SIGPIPE, SIG_IGN);
+
+  mach_server_register(&g_mach_server, g_bootstrap_name);
+
+  lua_getglobal(L, "os");
+  lua_pushcfunction(L, os_execute_sig);
+  lua_setfield(L, -2, "execute");
+
   luaL_newlib(L, functions);
 
   lua_pushcfunction(L, subscribe);
@@ -727,6 +872,9 @@ int luaopen_sketchybar(lua_State* L) {
   lua_pushcfunction(L, add);
   lua_setfield(L, -2, "add");
 
+  lua_pushcfunction(L, remove_sbar);
+  lua_setfield(L, -2, "remove");
+
   lua_pushcfunction(L, event_loop);
   lua_setfield(L, -2, "update");
 
@@ -741,6 +889,15 @@ int luaopen_sketchybar(lua_State* L) {
 
   lua_pushcfunction(L, exec);
   lua_setfield(L, -2, "exec");
+
+  lua_pushcfunction(L, delay);
+  lua_setfield(L, -2, "delay");
+
+  lua_pushcfunction(L, transaction_create);
+  lua_setfield(L, -2, "begin_config");
+
+  lua_pushcfunction(L, transaction_commit);
+  lua_setfield(L, -2, "end_config");
 
   return 1;
 }

@@ -5,10 +5,11 @@
 #include <pthread.h>
 #include <stdio.h>
 #include <unistd.h>
+#include <CoreFoundation/CoreFoundation.h>
 
 typedef char* env;
 
-#define MACH_HANDLER(name) void name(env env)
+#define MACH_HANDLER(name) void name(char* message, size_t size)
 typedef MACH_HANDLER(mach_handler);
 
 struct mach_message {
@@ -23,12 +24,9 @@ struct mach_buffer {
 };
 
 struct mach_server {
-  bool is_running;
   mach_port_name_t task;
   mach_port_t port;
   mach_port_t bs_port;
-
-  pthread_t thread;
   mach_handler* handler;
 };
 
@@ -115,32 +113,37 @@ static inline void mach_receive_message(mach_port_t port, struct mach_buffer* bu
   }
 }
 
-static inline char* mach_send_message(mach_port_t port, char* message, uint32_t len) {
+static inline char* mach_send_message(mach_port_t port, char* message, uint32_t len, bool response) {
   if (!message || !port) {
     return NULL;
   }
 
   mach_port_t response_port;
-  mach_port_name_t task = mach_task_self();
-  if (mach_port_allocate(task, MACH_PORT_RIGHT_RECEIVE,
-                               &response_port          ) != KERN_SUCCESS) {
-    return NULL;
-  }
+  mach_port_name_t task = 0;
+  if (response) {
+    task = mach_task_self();
+    if (mach_port_allocate(task, MACH_PORT_RIGHT_RECEIVE,
+                                 &response_port          ) != KERN_SUCCESS) {
+      return NULL;
+    }
 
-  if (mach_port_insert_right(task, response_port,
-                                   response_port,
-                                   MACH_MSG_TYPE_MAKE_SEND)!= KERN_SUCCESS) {
-    return NULL;
+    if (mach_port_insert_right(task, response_port,
+                                     response_port,
+                                     MACH_MSG_TYPE_MAKE_SEND)!= KERN_SUCCESS) {
+      return NULL;
+    }
   }
 
   struct mach_message msg = { 0 };
   msg.header.msgh_remote_port = port;
-  msg.header.msgh_local_port = response_port;
-  msg.header.msgh_id = response_port;
+  if (response) {
+    msg.header.msgh_local_port = response_port;
+    msg.header.msgh_id = response_port;
+  }
   msg.header.msgh_bits = MACH_MSGH_BITS_SET(MACH_MSG_TYPE_COPY_SEND,
                                             MACH_MSG_TYPE_MAKE_SEND,
                                             0,
-                                            MACH_MSGH_BITS_COMPLEX       );
+                                            MACH_MSGH_BITS_COMPLEX  );
 
   msg.header.msgh_size = sizeof(struct mach_message);
   msg.msgh_descriptor_count = 1;
@@ -158,26 +161,26 @@ static inline char* mach_send_message(mach_port_t port, char* message, uint32_t 
                                    MACH_MSG_TIMEOUT_NONE,
                                    MACH_PORT_NULL              );
   
-  if (ret != KERN_SUCCESS) {
-    return NULL;
-  }
-
-  struct mach_buffer buffer = { 0 };
-  mach_receive_message(response_port, &buffer, true);
+  if (ret != KERN_SUCCESS) return NULL;
 
   char* rsp = NULL;
-  if (buffer.message.descriptor.address) {
-    rsp = malloc(strlen(buffer.message.descriptor.address) + 1);
-    memcpy(rsp, buffer.message.descriptor.address,
-                strlen(buffer.message.descriptor.address) + 1);
-  } else {
-    rsp = malloc(1);
-    *rsp = '\0';
-  }
+  if (response) {
+    struct mach_buffer buffer = { 0 };
+    mach_receive_message(response_port, &buffer, true);
 
-  mach_msg_destroy(&buffer.message.header);
-  mach_port_mod_refs(task, response_port, MACH_PORT_RIGHT_RECEIVE, -1);
-  mach_port_deallocate(task, response_port);
+    if (buffer.message.descriptor.address) {
+      rsp = malloc(strlen(buffer.message.descriptor.address) + 1);
+      memcpy(rsp, buffer.message.descriptor.address,
+                  strlen(buffer.message.descriptor.address) + 1);
+    } else {
+      rsp = malloc(1);
+      *rsp = '\0';
+    }
+
+    mach_msg_destroy(&buffer.message.header);
+    mach_port_mod_refs(task, response_port, MACH_PORT_RIGHT_RECEIVE, -1);
+    mach_port_deallocate(task, response_port);
+  }
 
   return rsp;
 }
@@ -227,21 +230,40 @@ static inline bool mach_server_register(struct mach_server* mach_server, char* b
   return true;
 }
 
+void mach_message_callback(CFMachPortRef port, void* message, CFIndex size, void* context) {
+  struct mach_server* mach_server = context;
+  struct mach_buffer buffer;
+  buffer.message = *(struct mach_message*)message;
+
+  if (!buffer.message.descriptor.address) return;
+  if (*(char*)buffer.message.descriptor.address == 'k'
+      && buffer.message.descriptor.size == 2) {
+    exit(0);
+  }
+
+  mach_server->handler(buffer.message.descriptor.address,
+                       buffer.message.descriptor.size    );
+
+  mach_msg_destroy(&buffer.message.header);
+}
+
 static inline bool mach_server_begin(struct mach_server* mach_server, mach_handler handler) {
   mach_server->handler = handler;
-  mach_server->is_running = true;
-  struct mach_buffer buffer;
-  while (mach_server->is_running) {
-    mach_receive_message(mach_server->port, &buffer, true);
-    if (getppid() == 1) exit(0);
-    if (!buffer.message.descriptor.address) continue;
-    if (*(char*)buffer.message.descriptor.address == 'k'
-        && buffer.message.descriptor.size == 2) {
-      exit(0);
-    }
-    mach_server->handler((env)buffer.message.descriptor.address);
-    mach_msg_destroy(&buffer.message.header);
-  }
+
+  CFMachPortContext context = {0, (void*)mach_server};
+  CFMachPortRef cf_mach_port = CFMachPortCreateWithPort(NULL,
+                                                        mach_server->port,
+                                                        mach_message_callback,
+                                                        &context,
+                                                        false                );
+
+  CFRunLoopSourceRef source = CFMachPortCreateRunLoopSource(NULL,
+                                                            cf_mach_port,
+                                                            0            );
+
+  CFRunLoopAddSource(CFRunLoopGetMain(), source, kCFRunLoopDefaultMode);
+  CFRelease(source);
+  CFRelease(cf_mach_port);
 
   return true;
 }
